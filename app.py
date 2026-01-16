@@ -1,91 +1,82 @@
 import streamlit as st
 import requests
-import uuid
-import pandas as pd
 import time
-import os
-import subprocess
+import pandas as pd
 
-# --- AUTO-INSTALL PLAYWRIGHT (As per your request) ---
-def ensure_playwright_installed():
-    try:
-        import playwright
-    except ImportError:
-        subprocess.run(["pip", "install", "playwright"])
-    
-    # Check if chromium is installed, if not, install it
-    # Note: On Streamlit Cloud, you may need a 'packages.txt' with playwright dependencies
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        st.error(f"Error installing Playwright Chromium: {e}")
-
-ensure_playwright_installed()
-
-# --- MAIL.TM API CONFIG ---
+# API Base URL
 BASE_URL = "https://api.mail.tm"
 
 def get_domains():
     response = requests.get(f"{BASE_URL}/domains")
     if response.status_code == 200:
-        return [d['domain'] for d in response.json()['hydra:member']]
+        return response.json().get('hydra:member', [])
     return []
 
 def create_account(address, password):
     payload = {"address": address, "password": password}
     response = requests.post(f"{BASE_URL}/accounts", json=payload)
-    return response.status_code, response.json()
+    return response
 
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="Mail.tm Bulk Creator", page_icon="📧")
+def get_token(address, password):
+    payload = {"address": address, "password": password}
+    response = requests.post(f"{BASE_URL}/token", json=payload)
+    return response.json().get('token') if response.status_code == 200 else None
 
-st.title("📧 Mail.tm Bulk Account Generator")
-st.markdown("Create temporary email accounts in bulk using the Mail.tm API.")
+def fetch_messages(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(f"{BASE_URL}/messages", headers=headers)
+    if response.status_code == 200:
+        return response.json().get('hydra:member', [])
+    return []
 
-# Sidebar Settings
-st.sidebar.header("Settings")
-domains = get_domains()
-selected_domain = st.sidebar.selectbox("Select Domain", domains if domains else ["Loading..."])
-password_input = st.sidebar.text_input("Default Password", value="Pass1234!", type="password")
+# --- UI Setup ---
+st.set_page_config(page_title="Mail.tm Manager", layout="wide")
+st.title("📬 Mail.tm Bulk Account & Inbox Manager")
 
-# Tabs for Single/Bulk
-tab1, tab2 = st.tabs(["Single Account", "Bulk Creation"])
+if 'accounts' not in st.session_state:
+    st.session_state.accounts = []
 
-with tab1:
-    user_part = st.text_input("Username (Leave blank for random)", "")
-    if st.button("Create Single Account"):
-        username = user_part if user_part else str(uuid.uuid4())[:8]
-        full_email = f"{username}@{selected_domain}"
-        
-        status, resp = create_account(full_email, password_input)
-        if status == 201:
-            st.success(f"Created: {full_email}")
-            st.code(f"Email: {full_email}\nPassword: {password_input}")
-        else:
-            st.error(f"Error: {resp.get('hydra:description', 'Unknown error')}")
-
-with tab2:
-    count = st.number_input("Number of accounts", min_value=1, max_value=50, value=5)
-    if st.button(f"Generate {count} Accounts"):
-        results = []
-        progress_bar = st.progress(0)
-        
-        for i in range(count):
-            username = str(uuid.uuid4())[:10]
-            email = f"{username}@{selected_domain}"
-            status, resp = create_account(email, password_input)
-            
-            if status == 201:
-                results.append({"Email": email, "Password": password_input, "Status": "Success"})
+# Sidebar: Create Accounts
+with st.sidebar:
+    st.header("Create New Accounts")
+    domains = get_domains()
+    domain_names = [d['domain'] for d in domains]
+    
+    selected_domain = st.selectbox("Select Domain", domain_names)
+    prefix = st.text_input("Email Prefix (e.g., testuser)", "user")
+    pwd = st.text_input("Password", "SecurePass123!", type="password")
+    bulk_count = st.number_input("Number of accounts", min_value=1, max_value=10, value=1)
+    
+    if st.button("🚀 Generate Accounts"):
+        for i in range(bulk_count):
+            email = f"{prefix}{int(time.time()) + i}@{selected_domain}"
+            res = create_account(email, pwd)
+            if res.status_code == 201:
+                token = get_token(email, pwd)
+                st.session_state.accounts.append({"email": email, "password": pwd, "token": token})
+                st.success(f"Created: {email}")
             else:
-                results.append({"Email": email, "Password": "N/A", "Status": "Failed"})
-            
-            progress_bar.progress((i + 1) / count)
-            time.sleep(0.5) # Avoid rate limiting
+                st.error(f"Failed {email}: {res.text}")
+
+# Main Area: Account Management
+if st.session_state.accounts:
+    st.subheader("Manage Generated Accounts")
+    df = pd.DataFrame(st.session_state.accounts)[["email", "password"]]
+    st.dataframe(df, use_container_width=True)
+
+    selected_acc = st.selectbox("Select account to view Inbox", 
+                                [a['email'] for a in st.session_state.accounts])
+    
+    if st.button("🔄 Refresh Inbox"):
+        acc_data = next(item for item in st.session_state.accounts if item["email"] == selected_acc)
+        messages = fetch_messages(acc_data['token'])
         
-        df = pd.DataFrame(results)
-        st.table(df)
-        
-        # Download CSV
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download CSV", csv, "mail_tm_accounts.csv", "text/csv")
+        if not messages:
+            st.info("No messages found.")
+        for msg in messages:
+            with st.expander(f"From: {msg['from']['address']} - {msg['subject']}"):
+                st.write(f"**Date:** {msg['createdAt']}")
+                st.write(msg['intro'])
+                # To get full body, you'd call /messages/{id}
+else:
+    st.info("No accounts generated yet. Use the sidebar to create some!")
